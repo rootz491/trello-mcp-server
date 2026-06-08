@@ -11,6 +11,16 @@
 interface Env {
   TRELLO_API_KEY: string;
   TRELLO_TOKEN: string;
+  MCP_AUTH_TOKEN: string;
+}
+
+function unauthorized(): Response {
+  return new Response('Unauthorized', { status: 401 });
+}
+
+function isAuthorized(request: Request, env: Env): boolean {
+  const auth = request.headers.get('Authorization');
+  return auth === `Bearer ${env.MCP_AUTH_TOKEN}`;
 }
 
 const TRELLO_BASE_URL = 'https://api.trello.com/1';
@@ -34,6 +44,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method !== 'POST') {
       return new Response('MCP Server: Use POST', { status: 405 });
+    }
+
+    if (!isAuthorized(request, env)) {
+      return unauthorized();
     }
 
     try {

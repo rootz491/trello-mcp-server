@@ -5,3 +5,4 @@ compatibility_date = "2024-06-08"
 [vars]
 # TRELLO_API_KEY = "your-key"
 # TRELLO_TOKEN = "your-token"
+# MCP_AUTH_TOKEN = "your-secret-api-key"

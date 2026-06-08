@@ -26,6 +26,18 @@ npm run build
 
 After building, compiled output appears in `dist/index.js`.
 
+## Security
+
+Every request must include an `Authorization` header with your secret API key:
+
+```
+Authorization: Bearer <your-secret-api-key>
+```
+
+The worker validates this against the `MCP_AUTH_TOKEN` environment variable. Requests without a valid token receive `401 Unauthorized`.
+
+Generate a strong token (for example `openssl rand -hex 32`) and never commit it to git.
+
 ## Local development
 
 Create a `.dev.vars` file in the project root (this file is gitignored):
@@ -33,6 +45,7 @@ Create a `.dev.vars` file in the project root (this file is gitignored):
 ```
 TRELLO_API_KEY=your_key
 TRELLO_TOKEN=your_token
+MCP_AUTH_TOKEN=your_secret_api_key
 ```
 
 Start the local worker:
@@ -56,6 +69,7 @@ Wrangler prints a local URL (typically `http://localhost:8787`). The worker acce
    ```bash
    npx wrangler secret put TRELLO_API_KEY
    npx wrangler secret put TRELLO_TOKEN
+   npx wrangler secret put MCP_AUTH_TOKEN
    ```
 
 3. Build and deploy:
@@ -74,13 +88,16 @@ Add the worker URL to your Cursor MCP configuration:
 {
   "mcpServers": {
     "trello": {
-      "url": "https://trello-mcp-server.<your-subdomain>.workers.dev"
+      "url": "https://trello-mcp-server.<your-subdomain>.workers.dev",
+      "headers": {
+        "Authorization": "Bearer your_secret_api_key"
+      }
     }
   }
 }
 ```
 
-Replace the URL with your actual deployed worker address.
+Replace the URL and bearer token with your deployed worker address and `MCP_AUTH_TOKEN` value.
 
 ## Project structure
 
