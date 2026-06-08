@@ -1,5 +1,5 @@
 name = "trello-mcp-server"
-main = "index.ts"
+main = "dist/index.js"
 compatibility_date = "2024-06-08"
 
 [vars]
