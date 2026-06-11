@@ -191,8 +191,37 @@ export default {
         });
       }
 
+      // Handle POST /sse
+      if (request.method === 'POST' && url.pathname === '/sse') {
+        debugLog('[POST /sse] Request received');
+        if (!isAuthorized(request, env)) {
+          debugLog('[POST /sse] Unauthorized request');
+          return unauthorized();
+        }
+
+        let body: any = {};
+        try {
+          const text = await request.text();
+          if (text.trim()) {
+            body = JSON.parse(text);
+          }
+        } catch (err: any) {
+          debugLog(`[POST /sse] Non-JSON or empty body accepted: ${err.message}`);
+        }
+
+        debugLog(`[POST /sse] Handled body: ${JSON.stringify(body)}`);
+
+        return new Response(JSON.stringify({ status: 'ok' }), {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json',
+            ...CORS_HEADERS,
+          },
+        });
+      }
+
       // 2. Handle Messages (POST /messages)
-      if (request.method === 'POST') {
+      if (request.method === 'POST' && url.pathname === '/messages') {
         debugLog('[POST /messages] Request received');
         if (!isAuthorized(request, env)) {
           debugLog('[POST /messages] Unauthorized request');
