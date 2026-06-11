@@ -39,7 +39,7 @@ function debugLog(msg: string) {
 }
 
 function unauthorized(): Response {
-  return new Response('Unauthorized', { 
+  return new Response('Unauthorized', {
     status: 401,
     headers: { ...CORS_HEADERS }
   });
@@ -47,7 +47,7 @@ function unauthorized(): Response {
 
 function isAuthorized(request: Request, env: Env): boolean {
   if (!env.MCP_AUTH_TOKEN) return true;
-  
+
   const auth = request.headers.get('Authorization');
   if (auth === `Bearer ${env.MCP_AUTH_TOKEN}`) return true;
 
@@ -153,7 +153,7 @@ export default {
 
           async pull(controller) {
             debugLog(`[Stream Pull] Pulling messages for session: ${sessionId}`);
-            
+
             // Loop until we have enqueued at least one message or the session is terminated.
             // This prevents pull() from returning without enqueuing anything, which would
             // cause the runtime to stop calling pull() and hang the stream.
@@ -211,7 +211,12 @@ export default {
 
         debugLog(`[POST /sse] Handled body: ${JSON.stringify(body)}`);
 
-        return new Response(JSON.stringify({ status: 'ok' }), {
+        return new Response(JSON.stringify({
+          endpoint: "/messages",
+          capabilities: {
+            tools: { listChanged: true }
+          },
+        }), {
           status: 200,
           headers: {
             'Content-Type': 'application/json',
@@ -230,7 +235,7 @@ export default {
 
         const sessionId = url.searchParams.get('sessionId');
         debugLog(`[POST /messages] sessionId from URL: ${sessionId}`);
-        
+
         if (!sessionId) {
           debugLog('[POST /messages] Missing sessionId');
           return new Response('Missing sessionId query parameter', {
