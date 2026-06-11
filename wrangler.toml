@@ -12,4 +12,4 @@ enabled = false
 invocation_logs = true
 
 [observability.traces]
-enabled = false
+enabled = true
