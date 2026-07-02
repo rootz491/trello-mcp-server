@@ -1,9 +1,9 @@
 /**
- * Cloudflare Worker MCP Server for Trello with SSE Transport
+ * Cloudflare Worker MCP Server for Trello with stateless HTTP messages
  * 
  * Supports Poke's MCP requirements:
- * - GET /sse: Establish EventSource connection
- * - POST /messages: Receive JSON-RPC messages
+ * - GET /sse: Establish EventSource connection and announce message endpoint
+ * - POST /messages: Receive and answer JSON-RPC messages without isolate-local state
  */
 
 interface Env {
@@ -13,19 +13,39 @@ interface Env {
 }
 
 const TRELLO_BASE_URL = 'https://api.trello.com/1';
+const MCP_PROTOCOL_VERSION = '2024-11-05';
+const SSE_KEEP_ALIVE_INTERVAL_MS = 15000;
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept, Mcp-Session-Id, Last-Event-ID',
+  'Access-Control-Expose-Headers': 'Mcp-Session-Id',
 };
 
-interface Session {
-  queue: string[];
+type JsonRpcId = string | number | null;
+
+interface JsonRpcError {
+  code: number;
+  message: string;
 }
 
-// Global session tracking map (shared within the same isolate)
-const sessions = new Map<string, Session>();
+interface JsonRpcResponse {
+  jsonrpc: '2.0';
+  id: JsonRpcId;
+  result?: unknown;
+  error?: JsonRpcError;
+}
+
+class JsonRpcException extends Error {
+  constructor(
+    readonly code: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'JsonRpcException';
+  }
+}
 
 // Memory log buffer for debugging
 const debugLogs: string[] = [];
@@ -72,6 +92,332 @@ async function trelloFetch(path: string, env: Env, params: Record<string, string
   return response.json();
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isJsonRpcId(value: unknown): value is JsonRpcId {
+  return value === null || typeof value === 'string' || typeof value === 'number';
+}
+
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function makeJsonRpcResult(id: JsonRpcId, result: unknown): JsonRpcResponse {
+  return { jsonrpc: '2.0', id, result };
+}
+
+function makeJsonRpcError(id: JsonRpcId, code: number, message: string): JsonRpcResponse {
+  return { jsonrpc: '2.0', id, error: { code, message } };
+}
+
+function jsonResponse(payload: unknown, status = 200, extraHeaders: HeadersInit = {}): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...CORS_HEADERS,
+      ...extraHeaders,
+    },
+  });
+}
+
+function responseHeaders(sessionId: string | null = null): HeadersInit {
+  return sessionId
+    ? { ...CORS_HEADERS, 'Mcp-Session-Id': sessionId }
+    : { ...CORS_HEADERS };
+}
+
+function getStringArg(args: Record<string, unknown>, key: string): string | null {
+  const value = args[key];
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function getLimitArg(args: Record<string, unknown>): string {
+  const value = args.limit;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === 'string' && value.trim()) {
+    return value;
+  }
+  return '10';
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+
+    const timeoutId = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      clearTimeout(timeoutId);
+      resolve();
+    };
+
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function createSseResponse(request: Request): Response {
+  const requestUrl = new URL(request.url);
+  const sessionId = crypto.randomUUID();
+  const messageUrl = new URL('/messages', request.url);
+  messageUrl.searchParams.set('sessionId', sessionId);
+
+  for (const authParam of ['token', 'auth']) {
+    const value = requestUrl.searchParams.get(authParam);
+    if (value) {
+      messageUrl.searchParams.set(authParam, value);
+    }
+  }
+
+  const encoder = new TextEncoder();
+  let cleanup: (() => void) | null = null;
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let closed = false;
+
+      const close = () => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        try {
+          controller.close();
+        } catch (err: unknown) {
+          debugLog(`[GET /sse] Stream already closed for session ${sessionId}: ${String(err)}`);
+        }
+      };
+
+      const write = (chunk: string): boolean => {
+        if (closed) {
+          return false;
+        }
+
+        try {
+          controller.enqueue(encoder.encode(chunk));
+          return true;
+        } catch (err: unknown) {
+          debugLog(`[GET /sse] Failed writing to SSE stream for session ${sessionId}: ${String(err)}`);
+          closed = true;
+          try {
+            controller.error(err);
+          } catch {
+            // The stream may already be closed by the runtime.
+          }
+          return false;
+        }
+      };
+
+      const onAbort = () => {
+        debugLog(`[GET /sse] Connection aborted/closed by client for session: ${sessionId}`);
+        close();
+      };
+
+      cleanup = () => {
+        request.signal.removeEventListener('abort', onAbort);
+        close();
+      };
+
+      request.signal.addEventListener('abort', onAbort, { once: true });
+
+      void (async () => {
+        try {
+          debugLog(`[GET /sse] Announcing stateless endpoint for session: ${sessionId}`);
+          write(`event: endpoint\ndata: ${messageUrl.toString()}\n\n`);
+
+          while (!request.signal.aborted && !closed) {
+            await sleep(SSE_KEEP_ALIVE_INTERVAL_MS, request.signal);
+            if (!request.signal.aborted && !closed) {
+              write(':\n\n');
+            }
+          }
+        } finally {
+          debugLog(`[GET /sse] Writer cleanup running for session: ${sessionId}`);
+          cleanup?.();
+        }
+      })();
+    },
+
+    cancel(reason) {
+      debugLog(`[GET /sse] Stream cancelled for session ${sessionId}: ${String(reason)}`);
+      cleanup?.();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      ...responseHeaders(sessionId),
+    },
+  });
+}
+
+async function handleToolCall(params: unknown, env: Env): Promise<unknown> {
+  if (!isRecord(params) || typeof params.name !== 'string') {
+    throw new JsonRpcException(-32602, 'Invalid params: tools/call requires a string "name"');
+  }
+
+  const toolName = params.name;
+  const toolArgs = isRecord(params.arguments) ? params.arguments : {};
+  debugLog(`[JSON-RPC] Calling tool: "${toolName}" with args: ${JSON.stringify(toolArgs)}`);
+
+  let data: unknown;
+  if (toolName === 'list_boards') {
+    data = await trelloFetch('/members/me/boards', env, { fields: 'name,url' });
+  } else if (toolName === 'get_lists') {
+    const boardId = getStringArg(toolArgs, 'boardId');
+    if (!boardId) {
+      throw new JsonRpcException(-32602, 'Invalid params: get_lists requires "boardId"');
+    }
+    data = await trelloFetch(`/boards/${boardId}/lists`, env, { fields: 'name' });
+  } else if (toolName === 'list_cards') {
+    const listId = getStringArg(toolArgs, 'listId');
+    if (!listId) {
+      throw new JsonRpcException(-32602, 'Invalid params: list_cards requires "listId"');
+    }
+    data = await trelloFetch(`/lists/${listId}/cards`, env, { fields: 'name,desc,url' });
+  } else if (toolName === 'check_updates') {
+    const boardId = getStringArg(toolArgs, 'boardId');
+    if (!boardId) {
+      throw new JsonRpcException(-32602, 'Invalid params: check_updates requires "boardId"');
+    }
+    data = await trelloFetch(`/boards/${boardId}/actions`, env, { limit: getLimitArg(toolArgs) });
+  } else {
+    throw new JsonRpcException(-32601, `Unknown tool: ${toolName}`);
+  }
+
+  return {
+    content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+  };
+}
+
+async function handleJsonRpcMessage(message: unknown, env: Env): Promise<JsonRpcResponse | null> {
+  if (!isRecord(message)) {
+    return makeJsonRpcError(null, -32600, 'Invalid Request');
+  }
+
+  const id = isJsonRpcId(message.id) ? message.id : null;
+  const isNotification = !hasOwn(message, 'id');
+
+  if (typeof message.method !== 'string') {
+    return isNotification ? null : makeJsonRpcError(id, -32600, 'Invalid Request');
+  }
+
+  const { method, params } = message;
+  debugLog(`[JSON-RPC] Received method: "${method}", id: ${isNotification ? 'notification' : String(id)}`);
+
+  try {
+    let result: unknown;
+
+    switch (method) {
+      case 'initialize':
+        result = {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: {
+            tools: {}
+          },
+          serverInfo: { name: 'trello-mcp-worker', version: '1.1.0' },
+        };
+        break;
+
+      case 'notifications/initialized':
+        return null;
+
+      case 'ping':
+        result = {};
+        break;
+
+      case 'tools/list':
+      case 'list_tools':
+        result = {
+          tools: [
+            {
+              name: 'list_boards',
+              description: 'List all boards the user has access to.',
+              inputSchema: { type: 'object', properties: {} },
+            },
+            {
+              name: 'get_lists',
+              description: 'Get lists on a specific Trello board.',
+              inputSchema: {
+                type: 'object',
+                properties: { boardId: { type: 'string' } },
+                required: ['boardId'],
+              },
+            },
+            {
+              name: 'list_cards',
+              description: 'Get cards within a specific list.',
+              inputSchema: {
+                type: 'object',
+                properties: { listId: { type: 'string' } },
+                required: ['listId'],
+              },
+            },
+            {
+              name: 'check_updates',
+              description: 'Check for recent actions/updates on a board.',
+              inputSchema: {
+                type: 'object',
+                properties: { boardId: { type: 'string' }, limit: { type: 'number', default: 10 } },
+                required: ['boardId'],
+              },
+            },
+          ],
+        };
+        break;
+
+      case 'resources/list':
+        result = { resources: [] };
+        break;
+
+      case 'prompts/list':
+        result = { prompts: [] };
+        break;
+
+      case 'tools/call':
+      case 'call_tool':
+        result = await handleToolCall(params, env);
+        break;
+
+      default:
+        return isNotification ? null : makeJsonRpcError(id, -32601, `Method not found: ${method}`);
+    }
+
+    return isNotification ? null : makeJsonRpcResult(id, result);
+  } catch (err: unknown) {
+    const messageText = err instanceof Error ? err.message : 'Error processing request';
+    const code = err instanceof JsonRpcException ? err.code : -32603;
+    console.error('[JSON-RPC] Processing error:', err);
+    return isNotification ? null : makeJsonRpcError(id, code, messageText);
+  }
+}
+
+async function handleJsonRpcPayload(payload: unknown, env: Env): Promise<unknown | null> {
+  if (Array.isArray(payload)) {
+    if (payload.length === 0) {
+      return makeJsonRpcError(null, -32600, 'Invalid Request');
+    }
+
+    const responses = await Promise.all(payload.map((message) => handleJsonRpcMessage(message, env)));
+    return responses.filter((response): response is JsonRpcResponse => response !== null);
+  }
+
+  return handleJsonRpcMessage(payload, env);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
@@ -109,86 +455,7 @@ export default {
           return unauthorized();
         }
 
-        const sessionId = crypto.randomUUID();
-        debugLog(`[GET /sse] Created sessionId: ${sessionId}`);
-
-        const session: Session = {
-          queue: [],
-        };
-        sessions.set(sessionId, session);
-
-        const encoder = new TextEncoder();
-
-        // Periodically enqueue a keep-alive comment block
-        const keepAliveIntervalId = setInterval(() => {
-          if (sessions.has(sessionId)) {
-            debugLog(`[Keep-Alive] Enqueuing ping for session: ${sessionId}`);
-            session.queue.push(':\n\n');
-          }
-        }, 15000);
-
-        const cleanUp = () => {
-          debugLog(`[GET /sse] Cleanup running for session: ${sessionId}`);
-          clearInterval(keepAliveIntervalId);
-          sessions.delete(sessionId);
-        };
-
-        // Cleanup resources when client disconnects
-        request.signal.addEventListener('abort', () => {
-          debugLog(`[GET /sse] Connection aborted/closed by client for session: ${sessionId}`);
-          cleanUp();
-        });
-
-        // Create a native ReadableStream using a pull() lifecycle with 100ms polling.
-        // This ensures all controller.enqueue writes are executed by the runtime inside
-        // the active GET request context, satisfying Cloudflare Workers request isolation
-        // and avoiding cross-request context association issues.
-        const stream = new ReadableStream({
-          start(controller) {
-            debugLog(`[Stream Start] Queueing initial endpoint for session: ${sessionId}`);
-            const messageUrl = new URL(`/messages?sessionId=${sessionId}`, request.url).toString();
-            const endpointMessage = `event: endpoint\ndata: ${messageUrl}\n\n`;
-            controller.enqueue(encoder.encode(endpointMessage));
-          },
-
-          async pull(controller) {
-            debugLog(`[Stream Pull] Pulling messages for session: ${sessionId}`);
-
-            // Loop until we have enqueued at least one message or the session is terminated.
-            // This prevents pull() from returning without enqueuing anything, which would
-            // cause the runtime to stop calling pull() and hang the stream.
-            while (sessions.has(sessionId) && !request.signal.aborted) {
-              if (session.queue.length > 0) {
-                while (session.queue.length > 0) {
-                  const msg = session.queue.shift()!;
-                  debugLog(`[Stream Pull] Dequeueing and enqueuing message to client: ${msg.trim()}`);
-                  controller.enqueue(encoder.encode(msg));
-                }
-                return; // Success, we enqueued data
-              }
-
-              // Wait 100ms before checking the queue again
-              await new Promise<void>((resolve) => {
-                setTimeout(resolve, 100);
-              });
-            }
-            debugLog(`[Stream Pull] Exited loop (session deleted or aborted) for session: ${sessionId}`);
-          },
-
-          cancel() {
-            debugLog(`[Stream Cancel] Cancelled by client for session: ${sessionId}`);
-            cleanUp();
-          }
-        });
-
-        return new Response(stream, {
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            ...CORS_HEADERS,
-          },
-        });
+        return createSseResponse(request);
       }
 
       // Handle POST /sse
@@ -199,14 +466,15 @@ export default {
           return unauthorized();
         }
 
-        let body: any = {};
+        let body: unknown = {};
         try {
           const text = await request.text();
           if (text.trim()) {
             body = JSON.parse(text);
           }
-        } catch (err: any) {
-          debugLog(`[POST /sse] Non-JSON or empty body accepted: ${err.message}`);
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          debugLog(`[POST /sse] Non-JSON or empty body accepted: ${message}`);
         }
 
         debugLog(`[POST /sse] Handled body: ${JSON.stringify(body)}`);
@@ -233,156 +501,38 @@ export default {
           return unauthorized();
         }
 
-        const sessionId = url.searchParams.get('sessionId');
-        debugLog(`[POST /messages] sessionId from URL: ${sessionId}`);
-
-        if (!sessionId) {
-          debugLog('[POST /messages] Missing sessionId');
-          return new Response('Missing sessionId query parameter', {
-            status: 400,
-            headers: { ...CORS_HEADERS },
-          });
-        }
-
-        const session = sessions.get(sessionId);
-        if (!session) {
-          debugLog(`[POST /messages] Session ${sessionId} not found or expired`);
-          return new Response(`Session ${sessionId} not found or expired`, {
-            status: 400,
-            headers: { ...CORS_HEADERS },
-          });
-        }
+        const sessionId = url.searchParams.get('sessionId') || request.headers.get('Mcp-Session-Id');
+        debugLog(`[POST /messages] sessionId (optional/stateless): ${sessionId || 'none'}`);
 
         try {
-          const body = await request.json() as any;
-          const { method, params, id } = body;
-          debugLog(`[POST /messages] Received JSON-RPC method: "${method}", id: ${id}`);
+          const body = await request.json() as unknown;
+          const responsePayload = await handleJsonRpcPayload(body, env);
 
-          let result;
-          let error;
-
-          switch (method) {
-            case 'initialize':
-              result = {
-                protocolVersion: '2024-11-05',
-                capabilities: {
-                  tools: {}
-                },
-                serverInfo: { name: 'trello-mcp-worker', version: '1.1.0' },
-              };
-              break;
-
-            case 'tools/list':
-            case 'list_tools':
-              result = {
-                tools: [
-                  {
-                    name: 'list_boards',
-                    description: 'List all boards the user has access to.',
-                    inputSchema: { type: 'object', properties: {} },
-                  },
-                  {
-                    name: 'get_lists',
-                    description: 'Get lists on a specific Trello board.',
-                    inputSchema: {
-                      type: 'object',
-                      properties: { boardId: { type: 'string' } },
-                      required: ['boardId'],
-                    },
-                  },
-                  {
-                    name: 'list_cards',
-                    description: 'Get cards within a specific list.',
-                    inputSchema: {
-                      type: 'object',
-                      properties: { listId: { type: 'string' } },
-                      required: ['listId'],
-                    },
-                  },
-                  {
-                    name: 'check_updates',
-                    description: 'Check for recent actions/updates on a board.',
-                    inputSchema: {
-                      type: 'object',
-                      properties: { boardId: { type: 'string' }, limit: { type: 'number', default: 10 } },
-                      required: ['boardId'],
-                    },
-                  },
-                ],
-              };
-              break;
-
-            case 'resources/list':
-              result = { resources: [] };
-              break;
-
-            case 'prompts/list':
-              result = { prompts: [] };
-              break;
-
-            case 'tools/call':
-            case 'call_tool':
-              const toolName = params.name;
-              const toolArgs = params.arguments || {};
-              debugLog(`[POST /messages] Calling tool: "${toolName}" with args: ${JSON.stringify(toolArgs)}`);
-
-              try {
-                let data;
-                if (toolName === 'list_boards') {
-                  data = await trelloFetch('/members/me/boards', env, { fields: 'name,url' });
-                } else if (toolName === 'get_lists') {
-                  data = await trelloFetch(`/boards/${toolArgs.boardId}/lists`, env, { fields: 'name' });
-                } else if (toolName === 'list_cards') {
-                  data = await trelloFetch(`/lists/${toolArgs.listId}/cards`, env, { fields: 'name,desc,url' });
-                } else if (toolName === 'check_updates') {
-                  data = await trelloFetch(`/boards/${toolArgs.boardId}/actions`, env, { limit: toolArgs.limit?.toString() || '10' });
-                } else {
-                  error = { code: -32601, message: `Unknown tool: ${toolName}` };
-                }
-
-                if (!error) {
-                  result = {
-                    content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
-                  };
-                }
-              } catch (err: any) {
-                console.error('[POST /messages] Error in tool call:', err);
-                error = { code: -32603, message: err.message || 'Error executing tool' };
-              }
-              break;
-
-            default:
-              error = { code: -32601, message: `Method not found: ${method}` };
+          if (Array.isArray(responsePayload) && responsePayload.length === 0) {
+            debugLog('[POST /messages] Notification batch processed without response');
+            return new Response(null, {
+              status: 202,
+              headers: responseHeaders(sessionId),
+            });
           }
 
-          // Build the JSON-RPC response payload
-          const responsePayload: any = { jsonrpc: '2.0', id };
-          if (error) {
-            responsePayload.error = error;
-          } else {
-            responsePayload.result = result;
+          if (responsePayload === null) {
+            debugLog('[POST /messages] Notification processed without response');
+            return new Response(null, {
+              status: 202,
+              headers: responseHeaders(sessionId),
+            });
           }
 
-          // Enqueue the message and let the pull check pick it up
-          const sseMessage = `event: message\ndata: ${JSON.stringify(responsePayload)}\n\n`;
-          debugLog(`[POST /messages] Enqueuing response: ${sseMessage.trim()}`);
-          session.queue.push(sseMessage);
-
-          // Acknowledge receipt of the POST message
-          return new Response(null, {
-            status: 202,
-            headers: { ...CORS_HEADERS },
-          });
-
-        } catch (err: any) {
+          debugLog(`[POST /messages] Returning stateless JSON-RPC response: ${JSON.stringify(responsePayload)}`);
+          return jsonResponse(responsePayload, 200, sessionId ? { 'Mcp-Session-Id': sessionId } : {});
+        } catch (err: unknown) {
           console.error('[POST /messages] Parse/Processing error:', err);
-          return new Response(JSON.stringify({ error: { code: -32603, message: err.message || 'Invalid request format' } }), {
-            status: 400,
-            headers: {
-              'Content-Type': 'application/json',
-              ...CORS_HEADERS,
-            },
-          });
+          return jsonResponse(
+            makeJsonRpcError(null, -32700, 'Parse error: invalid JSON request body'),
+            400,
+            sessionId ? { 'Mcp-Session-Id': sessionId } : {},
+          );
         }
       }
 
@@ -391,9 +541,10 @@ export default {
         status: 404,
         headers: { ...CORS_HEADERS },
       });
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('[Fetch Handler] Fatal error:', error);
-      return new Response(error.message || 'Internal Server Error', {
+      const message = error instanceof Error ? error.message : 'Internal Server Error';
+      return new Response(message, {
         status: 500,
         headers: { ...CORS_HEADERS },
       });
