@@ -11,6 +11,9 @@
   },
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=18"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250609.0",
     "typescript": "^5.8.3",
